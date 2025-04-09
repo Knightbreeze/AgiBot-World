@@ -1,0 +1,28 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        
+        {
+            "name": "debug_agibot2lerobot",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/fs-computility/efm/kongweijie/AgiBot-World/scripts/mulit_convert_to_lerobot_nofisheye.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "args": [
+                "--src_path",
+                "/fs-computility/efm/shared/datasets/agibot-world/AgiBotWorld-Alpha/sample_dataset",
+                "--tgt_path",
+                "/fs-computility/efm/shared/datasets/agibot-world/lerobotV2_AgiBotWorld-Alpha_test",
+                "--repo_id",
+                "test2",
+                "--chunk_size",
+                "20"
+            ]
+        }
+    ]
+}
