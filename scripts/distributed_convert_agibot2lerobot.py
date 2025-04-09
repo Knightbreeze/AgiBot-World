@@ -438,6 +438,206 @@ def load_local_dataset(episode_id: int, src_path: str, task_id: int) -> Optional
         logging.error(f"加载episode {episode_id} 失败: {str(e)}")
         return None
 
+# ================== 数据集统计计算 ==================
+def get_stats_einops_patterns(dataset, num_workers=0):
+    """生成用于计算统计信息的einops模式"""
+    try:
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=num_workers,
+            batch_size=2,  # 使用小批量以避免内存问题
+            shuffle=False,
+        )
+        batch = next(iter(dataloader))
+
+        stats_patterns = {}
+        
+        for key in dataset.features:
+            # 确保张量不是float64
+            if batch[key].dtype == torch.float64:
+                logging.warning(f"键 {key} 的数据类型是float64，可能导致精度问题")
+                
+            # 图像和视频数据
+            if key in dataset.meta.camera_keys:
+                # 确保图像是通道优先格式
+                _, c, h, w = batch[key].shape
+                if not (c < h and c < w):
+                    logging.warning(f"图像格式可能有问题：{batch[key].shape}")
+                stats_patterns[key] = "b c h w -> c 1 1"
+            elif batch[key].ndim == 2:
+                stats_patterns[key] = "b c -> c "
+            elif batch[key].ndim == 1:
+                stats_patterns[key] = "b -> 1"
+            else:
+                raise ValueError(f"不支持的数据格式: {key}, shape={batch[key].shape}")
+            
+        return stats_patterns
+    except Exception as e:
+        logging.error(f"创建统计模式时出错: {str(e)}")
+        raise
+
+def compute_stats_fast(dataset, max_samples=1000, batch_size=64, num_workers=4):
+    """快速计算统计信息 - 仅使用少量样本"""
+    subset_indices = torch.randperm(len(dataset))[:max_samples]
+    subset = torch.utils.data.Subset(dataset, subset_indices)
+    return compute_stats(subset, batch_size, num_workers)
+
+def compute_stats(dataset, batch_size=64, num_workers=4, max_num_samples=None, pin_memory=True):
+    """计算LeRobotDataset中所有数据键的均值/标准差和最小值/最大值统计信息"""
+    try:
+        if max_num_samples is None:
+            max_num_samples = len(dataset)
+        else:
+            max_num_samples = min(max_num_samples, len(dataset))
+            
+        # 优化内存使用
+        mem_available = psutil.virtual_memory().available / (1024**3)  # GB
+        if mem_available < 4.0:  # 内存不足4GB时减小批量
+            logging.warning(f"可用内存不足 ({mem_available:.1f}GB)，降低batch_size")
+            batch_size = max(1, int(batch_size * mem_available / 8.0))
+        
+        logging.info(f"开始计算统计数据 (样本数={max_num_samples}, batch_size={batch_size}, workers={num_workers})")
+        
+        # 获取计算模式
+        stats_patterns = get_stats_einops_patterns(dataset, min(1, num_workers))
+
+        # 初始化统计变量
+        mean, std, max_vals, min_vals = {}, {}, {}, {}
+        for key in stats_patterns:
+            mean[key] = torch.tensor(0.0).float()
+            std[key] = torch.tensor(0.0).float()
+            max_vals[key] = torch.tensor(-float("inf")).float()
+            min_vals[key] = torch.tensor(float("inf")).float()
+
+        def create_seeded_dataloader(dataset, batch_size, seed):
+            """创建具有固定随机种子的数据加载器"""
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+            return torch.utils.data.DataLoader(
+                dataset,
+                num_workers=num_workers,
+                batch_size=batch_size,
+                shuffle=True,
+                drop_last=False,
+                generator=generator,
+                pin_memory=pin_memory,
+                persistent_workers=num_workers > 0
+            )
+
+        # 第一次遍历：计算均值、最小值和最大值
+        first_batch = None
+        running_item_count = 0
+        dataloader = create_seeded_dataloader(dataset, batch_size, seed=42)
+        
+        for i, batch in enumerate(tqdm(
+            dataloader,
+            total=min(ceil(max_num_samples / batch_size), ceil(len(dataset) / batch_size)),
+            desc="计算均值, 最小值, 最大值",
+        )):
+            this_batch_size = len(batch["index"])
+            running_item_count += this_batch_size
+            
+            if first_batch is None:
+                first_batch = {k: v.clone() if isinstance(v, torch.Tensor) else deepcopy(v) 
+                             for k, v in batch.items()}
+                
+            for key, pattern in stats_patterns.items():
+                try:
+                    # 确保数据是浮点类型
+                    batch[key] = batch[key].float()
+                    
+                    # 数值稳定的均值更新
+                    batch_mean = einops.reduce(batch[key], pattern, "mean")
+                    mean[key] = (
+                        mean[key]
+                        + this_batch_size * (batch_mean - mean[key]) / running_item_count
+                    )
+                    
+                    # 更新最大值和最小值
+                    max_vals[key] = torch.maximum(
+                        max_vals[key], einops.reduce(batch[key], pattern, "max")
+                    )
+                    min_vals[key] = torch.minimum(
+                        min_vals[key], einops.reduce(batch[key], pattern, "min")
+                    )
+                except Exception as e:
+                    logging.error(f"处理键 {key} 时发生错误: {str(e)}")
+                    
+            # 如果达到最大样本数，停止处理
+            if running_item_count >= max_num_samples:
+                break
+                
+            # 每10批次释放一次内存
+            if (i + 1) % 10 == 0:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # 第二次遍历：计算标准差
+        second_batch = None
+        running_item_count = 0
+        dataloader = create_seeded_dataloader(dataset, batch_size, seed=42)
+        
+        for i, batch in enumerate(tqdm(
+            dataloader,
+            total=min(ceil(max_num_samples / batch_size), ceil(len(dataset) / batch_size)),
+            desc="计算标准差",
+        )):
+            this_batch_size = len(batch["index"])
+            running_item_count += this_batch_size
+            
+            # 验证批次与第一次遍历相同
+            if second_batch is None:
+                second_batch = batch
+                for key in stats_patterns:
+                    try:
+                        if not torch.equal(second_batch[key], first_batch[key]):
+                            logging.warning(f"警告: 两次迭代的批次不匹配 ({key})")
+                    except:
+                        pass
+                        
+            for key, pattern in stats_patterns.items():
+                try:
+                    batch[key] = batch[key].float()
+                    
+                    # 计算标准差 (均方残差)
+                    batch_std = einops.reduce((batch[key] - mean[key]) ** 2, pattern, "mean")
+                    std[key] = (
+                        std[key] + this_batch_size * (batch_std - std[key]) / running_item_count
+                    )
+                except Exception as e:
+                    logging.error(f"计算标准差时键 {key} 出错: {str(e)}")
+                    
+            if running_item_count >= max_num_samples:
+                break
+                
+            # 每10批次释放一次内存
+            if (i + 1) % 10 == 0:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # 计算最终的标准差值（开平方）
+        for key in stats_patterns:
+            std[key] = torch.sqrt(std[key])
+
+        # 组装结果
+        stats = {}
+        for key in stats_patterns:
+            stats[key] = {
+                "mean": mean[key],
+                "std": std[key],
+                "max": max_vals[key],
+                "min": min_vals[key],
+            }
+            
+        logging.info("统计计算完成")
+        return stats
+        
+    except Exception as e:
+        logging.error(f"统计计算失败: {str(e)}\n{traceback.format_exc()}")
+        raise
+
 def get_task_instruction(task_json_path: str) -> str:
     """获取任务语言指令"""
     try:
@@ -455,7 +655,7 @@ def get_task_instruction(task_json_path: str) -> str:
 
 # ================== 数据集类继承 ==================
 class AgiBotDataset(LeRobotDataset):
-    """增强的AgiBotDataset，支持断点续传和错误恢复"""
+    """增强的AgiBotDataset, 支持断点续传和错误恢复"""
     
     def __init__(
         self,
@@ -562,7 +762,7 @@ class AgiBotDataset(LeRobotDataset):
             return False
 
     def consolidate(
-        self, run_compute_stats: bool = True, keep_image_files: bool = False
+        self, run_compute_stats: bool = True, keep_image_files: bool = False, fast_stats: bool = False
     ) -> None:
         """
         增强的consolidate方法，添加更多的错误处理
@@ -603,7 +803,14 @@ class AgiBotDataset(LeRobotDataset):
             if run_compute_stats:
                 logging.info("计算数据集统计信息...")
                 self.stop_image_writer()
-                self.meta.stats = compute_stats(self)
+                
+                # 使用快速统计模式或标准模式
+                if fast_stats:
+                    logging.info("使用快速统计模式 (仅使用1000个样本)")
+                    self.meta.stats = compute_stats_fast(self)
+                else:
+                    self.meta.stats = compute_stats(self)
+                    
                 serialized_stats = serialize_dict(self.meta.stats)
                 write_json(serialized_stats, self.root / STATS_PATH)
                 self.consolidated = True
@@ -1065,7 +1272,12 @@ if __name__ == "__main__":
         default=None,
         help="每个进程的工作线程数（默认自动检测）"
     )
-
+    
+    parser.add_argument(
+    "--fast_stats",
+    action="store_true",
+    help="使用快速统计模式（仅对数据集样本进行统计）"
+)
     # 配置日志
     log_format = "%(asctime)s [%(levelname)s] [%(processName)s] %(message)s"
     logging.basicConfig(

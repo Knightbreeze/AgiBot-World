@@ -203,7 +203,6 @@ def get_stats_einops_patterns(dataset, num_workers=0):
 
     return stats_patterns
 
-
 def compute_stats(dataset, batch_size=64, num_workers=4, max_num_samples=None):
     """Compute mean/std and min/max statistics of all data keys in a LeRobotDataset."""
     if max_num_samples is None:
@@ -309,7 +308,6 @@ def compute_stats(dataset, batch_size=64, num_workers=4, max_num_samples=None):
             "min": min[key],
         }
     return stats
-
 
 class AgiBotDataset(LeRobotDataset):
     def __init__(
@@ -460,7 +458,6 @@ class AgiBotDataset(LeRobotDataset):
 
         self.episode_buffer["size"] += 1
 
-
 def load_depths(root_dir: str, camera_name: str):
     cam_path = Path(root_dir)
     all_imgs = sorted(list(cam_path.glob(f"{camera_name}*")))
@@ -605,7 +602,7 @@ def process_single_task(
 def main(
     src_path: str,
     tgt_path: str,
-    repo_id: str = "agibotworld/all_tasks",
+    repo_id: str,
     debug: bool = False,
     chunk_size: int = 10
 ):
