@@ -44,16 +44,16 @@ FEATURES = {
         "shape": (480, 640, 3),
         "names": ["height", "width", "channel"],
     },
-    "observation.robot.qpos": {
+    "observation.robot.state": {
         "dtype": "float32",
-        "shape": (7,),
-        "names": ["arm_0", "arm_1", "arm_2", "arm_3", "arm_4", "arm_5", "arm_6"],
+        "shape": (8,),
+        "names": ["robot_arm_0", "robot_arm_1", "robot_arm_2", "robot_arm_3", "robot_arm_4", "robot_arm_5", "robot_arm_6", "gripper"],
     },
-    "observation.robot.ee_pose": {
-        "dtype": "float32",
-        "shape": (6,),
-        "names": ["x", "y", "z", "roll", "pitch", "yaw"],
-    },
+    # "observation.robot.ee_pose": {
+    #     "dtype": "float32",
+    #     "shape": (6,),
+    #     "names": ["x", "y", "z", "roll", "pitch", "yaw"],
+    # },
     "action": {
         "dtype": "float32",
         "shape": (7,),
@@ -287,9 +287,9 @@ def load_lmdb_data(episode_path: Path) -> Optional[Dict]:
                 all_delta_actions = pickle.loads(txn.get(b'delta_arm_ee_action'))
                 all_gripper_actions = pickle.loads(txn.get(b'gripper_action'))
                 all_qpos = pickle.loads(txn.get(b'observation/robot/qpos'))
-                all_ee_poses = pickle.loads(txn.get(b'observation/robot/forlan2robot_pose'))
+                # all_ee_poses = pickle.loads(txn.get(b'observation/robot/forlan2robot_pose'))
                # 确保所有序列长度足够
-                min_len = min(len(all_delta_actions), len(all_gripper_actions), len(all_qpos), len(all_ee_poses))
+                min_len = min(len(all_delta_actions), len(all_gripper_actions), len(all_qpos))
                 if min_len < total_steps:
                     print(f"调整步数: {total_steps} -> {min_len}")
                     total_steps = min_len
@@ -314,13 +314,16 @@ def load_lmdb_data(episode_path: Path) -> Optional[Dict]:
                     delta_ee = all_delta_actions[step]
                     gripper = all_gripper_actions[step]
                     qpos = all_qpos[step]
-                    ee_pose = all_ee_poses[step]
+                    # ee_pose = all_ee_poses[step]
                     
-                    # 处理ee_pose - 转换为6D位姿
-                    if isinstance(ee_pose, np.ndarray) and ee_pose.shape == (4, 4):
-                        ee_pose = pose_to_6d(ee_pose)
-                        
-                    # 创建动作数组
+                    # # 处理ee_pose - 转换为6D位姿
+                    # if isinstance(ee_pose, np.ndarray) and ee_pose.shape == (4, 4):
+                    #     ee_pose = pose_to_6d(ee_pose)
+
+                    # create state
+                    state = np.concatenate([qpos, [gripper]])
+
+                    # create action
                     if isinstance(delta_ee, np.ndarray):
                         if delta_ee.shape == (4, 4):
                             delta_ee = pose_to_6d(delta_ee)
@@ -332,11 +335,11 @@ def load_lmdb_data(episode_path: Path) -> Optional[Dict]:
                         
                     # 创建帧数据
                     frame = {
-                        "observation.robot.qpos": qpos[:7],
-                        "observation.robot.ee_pose": ee_pose[:6],
+                        "observation.robot.state": state[:8],
+                        # "observation.robot.ee_pose": ee_pose[:6],
                         "action": action[:7],
-                        "observation.images.Primary_0_0": primary_img,
-                        "observation.images.Wrist_0_0": wrist_img,
+                        # "observation.images.Primary_0_0": primary_img,
+                        # "observation.images.Wrist_0_0": wrist_img,
                         "task": task_name
                     }
                     frames.append(frame)
